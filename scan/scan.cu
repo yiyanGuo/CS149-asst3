@@ -43,17 +43,21 @@ static inline int nextPow2(int n) {
 // "in-place" scan, since the timing harness makes a copy of input and
 // places it in result
 __global__ void upSweep(int *input, int *result, int d,int N){
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int dd = 2 * d;
-    if(idx < N && (idx + 1) % dd == 0) {
-        result[idx] += result[idx - d];
+    long long t = blockIdx.x * blockDim.x + threadIdx.x;
+    long long dd = 2 * d;
+    long long idx = (t + 1) * dd - 1; // 将工作线程映射到输入数组的索引
+
+    if(idx < N) {
+        result[idx] = result[idx] + result[idx - d];
     }
 }
 
 __global__ void downSweep(int *input, int *result, int d, int N) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int dd = 2 * d;
-    if(idx < N && (idx + 1) % dd == 0) {
+    long long t = blockIdx.x * blockDim.x + threadIdx.x;
+    long long dd = 2 * d;
+    long long idx = (t + 1) * dd - 1; // 将工作线程映射到输入数组的索引
+
+    if(idx < N) {
         int t = result[idx - d];
         result[idx - d] = result[idx];
         result[idx] += t;
@@ -71,18 +75,21 @@ void exclusive_scan(int* input, int N, int* result)
     // on the CPU.  Your implementation will need to make multiple calls
     // to CUDA kernel functions (that you must write) to implement the
     // scan.
+    int rounded_length = nextPow2(N);
 
-    for(int d = 1; d <= N/2; d *= 2) {
-        int numBlocks = (N + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
-        upSweep<<<numBlocks, THREADS_PER_BLOCK>>>(input, result, d, N);
+    for(int d = 1; d <= rounded_length/2; d *= 2) {
+        int activeThreads = rounded_length / (2 * d); // 只启动需要的线程数量
+        int numBlocks = (activeThreads + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+        upSweep<<<numBlocks, THREADS_PER_BLOCK>>>(input, result, d, rounded_length);
         cudaDeviceSynchronize();
     }
 
-    cudaMemset(result + N - 1, 0, sizeof(int));
+    cudaMemset(result + rounded_length - 1, 0, sizeof(int));
 
-    for(int d = N/2; d >= 1; d /=2) {
-        int numBlocks = (N + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
-        downSweep<<<numBlocks, THREADS_PER_BLOCK>>>(input, result, d, N);
+    for(int d = rounded_length/2; d >= 1; d /=2) {
+        int activeThreads = rounded_length / (2 * d);
+        int numBlocks = (activeThreads + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+        downSweep<<<numBlocks, THREADS_PER_BLOCK>>>(input, result, d, rounded_length);
         cudaDeviceSynchronize();
     }
 
