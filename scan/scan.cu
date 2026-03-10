@@ -13,7 +13,7 @@
 #include "CycleTimer.h"
 
 #define THREADS_PER_BLOCK 256
-
+#define ELEMENT_PER_BLOCK (2 * THREADS_PER_BLOCK)
 
 // helper function to round an integer up to the next power of 2
 static inline int nextPow2(int n) {
@@ -42,27 +42,65 @@ static inline int nextPow2(int n) {
 // Also, as per the comments in cudaScan(), you can implement an
 // "in-place" scan, since the timing harness makes a copy of input and
 // places it in result
-__global__ void upSweep(int *input, int *result, int d,int N){
-    long long t = blockIdx.x * blockDim.x + threadIdx.x;
-    long long dd = 2 * d;
-    long long idx = (t + 1) * dd - 1; // 将工作线程映射到输入数组的索引
+__global__ void exclusive_scan_block(int *result, int *block_sums, int N) {
+    extern __shared__ int temp[]; 
 
-    if(idx < N) {
-        result[idx] = result[idx] + result[idx - d];
+    int t = threadIdx.x;
+    int bid = blockIdx.x;
+    size_t global_offset = bid * ELEMENT_PER_BLOCK;
+    size_t shared_offset = t * 2;
+
+    // 1. 安全加载
+    temp[shared_offset] = (global_offset + shared_offset < N) ? result[global_offset + shared_offset] : 0;
+    temp[shared_offset + 1] = (global_offset + shared_offset + 1 < N) ? result[global_offset + shared_offset + 1] : 0;
+    __syncthreads();
+
+    // 2. Up-sweep (Reduce)
+    for (int d = 1; d <= THREADS_PER_BLOCK; d *= 2) {
+        int dd = 2 * d;
+        if (t < (ELEMENT_PER_BLOCK / dd)) {
+            int idx = (t + 1) * dd - 1;
+            temp[idx] += temp[idx - d];
+        }
+        __syncthreads();
     }
+
+    // 3. 提取总和并清零末位
+    if (t == 0) {
+        if (block_sums != nullptr) block_sums[bid] = temp[ELEMENT_PER_BLOCK - 1];
+        temp[ELEMENT_PER_BLOCK - 1] = 0;
+    }
+    __syncthreads();
+
+    // 4. Down-sweep
+    for (int d = THREADS_PER_BLOCK; d >= 1; d /= 2) {
+        int dd = 2 * d;
+        if (t < (ELEMENT_PER_BLOCK / dd)) {
+            int idx = (t + 1) * dd - 1;
+            int val = temp[idx - d];
+            temp[idx - d] = temp[idx];
+            temp[idx] += val;
+        }
+        __syncthreads();
+    }
+
+    // 5. 安全写回
+    if (global_offset + shared_offset < N) 
+        result[global_offset + shared_offset] = temp[shared_offset];
+    if (global_offset + shared_offset + 1 < N) 
+        result[global_offset + shared_offset + 1] = temp[shared_offset + 1];
 }
 
-__global__ void downSweep(int *input, int *result, int d, int N) {
-    long long t = blockIdx.x * blockDim.x + threadIdx.x;
-    long long dd = 2 * d;
-    long long idx = (t + 1) * dd - 1; // 将工作线程映射到输入数组的索引
+__global__ void add_prefix_sum(int *result, int *block_sums, int N) {
+    size_t i1 = (size_t)blockIdx.x * ELEMENT_PER_BLOCK + threadIdx.x * 2;
+    size_t i2 = i1 + 1;
+    
+    int pre_block_sum = block_sums[blockIdx.x];
 
-    if(idx < N) {
-        int t = result[idx - d];
-        result[idx - d] = result[idx];
-        result[idx] += t;
-    }
+    if (i1 < N) result[i1] += pre_block_sum;
+    if (i2 < N) result[i2] += pre_block_sum;
 }
+
 
 void exclusive_scan(int* input, int N, int* result)
 {
@@ -76,25 +114,33 @@ void exclusive_scan(int* input, int N, int* result)
     // to CUDA kernel functions (that you must write) to implement the
     // scan.
     int rounded_length = nextPow2(N);
-
-    for(int d = 1; d <= rounded_length/2; d *= 2) {
-        int activeThreads = rounded_length / (2 * d); // 只启动需要的线程数量
-        int numBlocks = (activeThreads + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
-        upSweep<<<numBlocks, THREADS_PER_BLOCK>>>(input, result, d, rounded_length);
-        cudaDeviceSynchronize();
+    int num_blocks = rounded_length / (2 * THREADS_PER_BLOCK);
+    
+    if(N <= ELEMENT_PER_BLOCK) {
+        // 直接在一个块内完成扫描
+        size_t shared_mem_size = ELEMENT_PER_BLOCK * sizeof(int);
+        exclusive_scan_block<<<1, THREADS_PER_BLOCK, shared_mem_size>>>(result, nullptr, N);
+        return;
     }
 
-    cudaMemset(result + rounded_length - 1, 0, sizeof(int));
+    
+    
+    int *device_block_sums;
+    cudaMalloc(&device_block_sums, num_blocks * sizeof(int));
 
-    for(int d = rounded_length/2; d >= 1; d /=2) {
-        int activeThreads = rounded_length / (2 * d);
-        int numBlocks = (activeThreads + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
-        downSweep<<<numBlocks, THREADS_PER_BLOCK>>>(input, result, d, rounded_length);
-        cudaDeviceSynchronize();
-    }
+    // A: block sums
+    size_t shared_mem_size = ELEMENT_PER_BLOCK * sizeof(int);
+    exclusive_scan_block<<<num_blocks, THREADS_PER_BLOCK, shared_mem_size>>>(result, device_block_sums, rounded_length);
+
+    // B: scan block sums
+    exclusive_scan(device_block_sums, num_blocks, device_block_sums);
+
+    // C: add base
+    add_prefix_sum<<<num_blocks, THREADS_PER_BLOCK, shared_mem_size>>>(result, device_block_sums, rounded_length);
+
+    cudaFree(device_block_sums);
 
 }
-
 
 //
 // cudaScan --
