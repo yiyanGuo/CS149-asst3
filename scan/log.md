@@ -1,6 +1,6 @@
 test exclusive scan performance
 
-1. version1: simple cuda
+## 1. version1: simple cuda
 
 | Array Size | Student GPU Time (ms) |
 |------------|-----------------------|
@@ -9,7 +9,7 @@ test exclusive scan performance
 | 20,000,000 | 13.617                |
 | 40,000,000 | 26.970                |
 
-2. version2: block scan and add pre-block sum
+## v2. version2: block scan and add pre-block sum
 
 | Array Size | Student GPU Time (ms) |
 |------------|-----------------------|
@@ -17,3 +17,30 @@ test exclusive scan performance
 | 10,000,000 | 3.237                 |
 | 20,000,000 | 4.609                 |
 | 40,000,000 | 8.161                 |
+
+## 3. version3: allocate block_sums one time
+
+| Array Size | Student GPU Time (ms) |
+|------------|-----------------------|
+| 1,000,000  | 0.333                 | 
+| 10,000,000 | 1.91                  |
+| 20,000,000 | 3.306                 |
+| 40,000,000 | 5.582                 |
+
+## baseline(roofline...)
+
+| Array Size |  Thrust               |
+|------------|-----------------------|
+| 1,000,000  | 0.775                 | 
+| 10,000,000 | 1.547                 |
+| 20,000,000 | 1.924                 |
+| 40,000,000 | 2.857                 |
+
+
+## analyze
+| Array Size | Simple CUDA | Block Scan + Pre-block Sum | Allocate block_sums once | Thrust (Baseline) |
+|------------|-------------|---------------------------|-------------------------|-------------------|
+| 1,000,000  | 0.729       | 0.804                     | 0.333                   | 0.775             |
+| 10,000,000 | 7.069       | 3.237                     | 1.91                    | 1.547             |
+| 20,000,000 | 13.617      | 4.609                     | 3.306                   | 1.924             |
+| 40,000,000 | 26.970      | 8.161                     | 5.582                   | 2.857             |

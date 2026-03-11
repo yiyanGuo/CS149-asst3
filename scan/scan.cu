@@ -102,7 +102,7 @@ __global__ void add_prefix_sum(int *result, int *block_sums, int N) {
 }
 
 
-void exclusive_scan(int* input, int N, int* result)
+void exclusive_scan_impl(int* result, int *block_sums,int N)
 {
 
     // CS149 TODO:
@@ -113,8 +113,7 @@ void exclusive_scan(int* input, int N, int* result)
     // on the CPU.  Your implementation will need to make multiple calls
     // to CUDA kernel functions (that you must write) to implement the
     // scan.
-    int rounded_length = nextPow2(N);
-    int num_blocks = rounded_length / (2 * THREADS_PER_BLOCK);
+    int num_blocks = (N + ELEMENT_PER_BLOCK - 1) / ELEMENT_PER_BLOCK;
     
     if(N <= ELEMENT_PER_BLOCK) {
         // 直接在一个块内完成扫描
@@ -123,25 +122,27 @@ void exclusive_scan(int* input, int N, int* result)
         return;
     }
 
-    
-    
-    int *device_block_sums;
-    cudaMalloc(&device_block_sums, num_blocks * sizeof(int));
-
     // A: block sums
     size_t shared_mem_size = ELEMENT_PER_BLOCK * sizeof(int);
-    exclusive_scan_block<<<num_blocks, THREADS_PER_BLOCK, shared_mem_size>>>(result, device_block_sums, rounded_length);
+    exclusive_scan_block<<<num_blocks, THREADS_PER_BLOCK, shared_mem_size>>>(result, block_sums, N);
 
     // B: scan block sums
-    exclusive_scan(device_block_sums, num_blocks, device_block_sums);
+    exclusive_scan_impl(block_sums, block_sums + num_blocks, num_blocks);
 
     // C: add base
-    add_prefix_sum<<<num_blocks, THREADS_PER_BLOCK, shared_mem_size>>>(result, device_block_sums, rounded_length);
-
-    cudaFree(device_block_sums);
-
+    add_prefix_sum<<<num_blocks, THREADS_PER_BLOCK>>>(result, block_sums, N);
 }
 
+void exclusive_scan(int *input, int N, int *result) {
+    N = nextPow2(N);
+    int *device_block_sums;
+    size_t block_sums_size = 0;
+    for(size_t n = N / ELEMENT_PER_BLOCK; n > 1; n = (n + ELEMENT_PER_BLOCK - 1) / ELEMENT_PER_BLOCK) {
+        block_sums_size += sizeof(int) * n;
+    }
+    cudaMalloc(&device_block_sums, block_sums_size);
+    exclusive_scan_impl(result, device_block_sums, N);
+}
 //
 // cudaScan --
 //
