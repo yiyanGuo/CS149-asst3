@@ -14,7 +14,7 @@
 
 #define THREADS_PER_BLOCK 256
 #define ELEMENT_PER_BLOCK (2 * THREADS_PER_BLOCK)
-
+#define OFFSET(idx) idx + (idx >> 5)
 // helper function to round an integer up to the next power of 2
 static inline int nextPow2(int n) {
     n--;
@@ -48,11 +48,11 @@ __global__ void exclusive_scan_block(int *result, int *block_sums, int N) {
     int t = threadIdx.x;
     int bid = blockIdx.x;
     size_t global_offset = bid * ELEMENT_PER_BLOCK;
-    size_t shared_offset = t * 2;
+    size_t shared_offset = t;
 
     // 1. 安全加载
-    temp[shared_offset] = (global_offset + shared_offset < N) ? result[global_offset + shared_offset] : 0;
-    temp[shared_offset + 1] = (global_offset + shared_offset + 1 < N) ? result[global_offset + shared_offset + 1] : 0;
+    temp[OFFSET(shared_offset)] = (global_offset + shared_offset < N) ? result[global_offset + shared_offset] : 0;
+    temp[OFFSET(shared_offset + THREADS_PER_BLOCK)] = (global_offset + shared_offset + THREADS_PER_BLOCK < N) ? result[global_offset + shared_offset + THREADS_PER_BLOCK] : 0;
     __syncthreads();
 
     // 2. Up-sweep (Reduce)
@@ -60,15 +60,15 @@ __global__ void exclusive_scan_block(int *result, int *block_sums, int N) {
         int dd = 2 * d;
         if (t < (ELEMENT_PER_BLOCK / dd)) {
             int idx = (t + 1) * dd - 1;
-            temp[idx] += temp[idx - d];
+            temp[OFFSET(idx)] += temp[OFFSET(idx - d)];
         }
         __syncthreads();
     }
 
     // 3. 提取总和并清零末位
     if (t == 0) {
-        if (block_sums != nullptr) block_sums[bid] = temp[ELEMENT_PER_BLOCK - 1];
-        temp[ELEMENT_PER_BLOCK - 1] = 0;
+        if (block_sums != nullptr) block_sums[bid] = temp[OFFSET(ELEMENT_PER_BLOCK - 1)];
+        temp[OFFSET(ELEMENT_PER_BLOCK - 1)] = 0;
     }
     __syncthreads();
 
@@ -77,23 +77,23 @@ __global__ void exclusive_scan_block(int *result, int *block_sums, int N) {
         int dd = 2 * d;
         if (t < (ELEMENT_PER_BLOCK / dd)) {
             int idx = (t + 1) * dd - 1;
-            int val = temp[idx - d];
-            temp[idx - d] = temp[idx];
-            temp[idx] += val;
+            int val = temp[OFFSET(idx - d)];
+            temp[OFFSET(idx - d)] = temp[OFFSET(idx)];
+            temp[OFFSET(idx)] += val;
         }
         __syncthreads();
     }
 
     // 5. 安全写回
     if (global_offset + shared_offset < N) 
-        result[global_offset + shared_offset] = temp[shared_offset];
-    if (global_offset + shared_offset + 1 < N) 
-        result[global_offset + shared_offset + 1] = temp[shared_offset + 1];
+        result[global_offset + shared_offset] = temp[OFFSET(shared_offset)];
+    if (global_offset + shared_offset + THREADS_PER_BLOCK < N) 
+        result[global_offset + shared_offset + THREADS_PER_BLOCK] = temp[OFFSET(shared_offset + THREADS_PER_BLOCK)];
 }
 
 __global__ void add_prefix_sum(int *result, int *block_sums, int N) {
-    size_t i1 = (size_t)blockIdx.x * ELEMENT_PER_BLOCK + threadIdx.x * 2;
-    size_t i2 = i1 + 1;
+    size_t i1 = (size_t)blockIdx.x * ELEMENT_PER_BLOCK + threadIdx.x;
+    size_t i2 = i1 + THREADS_PER_BLOCK;
     
     int pre_block_sum = block_sums[blockIdx.x];
 
@@ -118,12 +118,14 @@ void exclusive_scan_impl(int* result, int *block_sums,int N)
     if(N <= ELEMENT_PER_BLOCK) {
         // 直接在一个块内完成扫描
         size_t shared_mem_size = ELEMENT_PER_BLOCK * sizeof(int);
+        shared_mem_size += shared_mem_size / 32; // 预留一些共享内存用于避免bank conflict
         exclusive_scan_block<<<1, THREADS_PER_BLOCK, shared_mem_size>>>(result, nullptr, N);
         return;
     }
 
     // A: block sums
     size_t shared_mem_size = ELEMENT_PER_BLOCK * sizeof(int);
+    shared_mem_size += shared_mem_size / 32; // 预留一些共享内存用于避免bank conflict
     exclusive_scan_block<<<num_blocks, THREADS_PER_BLOCK, shared_mem_size>>>(result, block_sums, N);
 
     // B: scan block sums
@@ -142,6 +144,8 @@ void exclusive_scan(int *input, int N, int *result) {
     }
     cudaMalloc(&device_block_sums, block_sums_size);
     exclusive_scan_impl(result, device_block_sums, N);
+
+    cudaFree(device_block_sums);
 }
 //
 // cudaScan --
@@ -232,6 +236,28 @@ double cudaScanThrust(int* inarray, int* end, int* resultarray) {
 // indices `i` for which `device_input[i] == device_input[i+1]`.
 //
 // Returns the total number of pairs found
+__global__ void map_repeats(int *input, int *output, int N) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < N - 1) {
+        output[idx] = (input[idx] == input[idx + 1]) ? 1 : 0;
+    }
+    else if (idx == N - 1) {
+        output[idx] = 0; // 最后一个元素没有下一个元素，不能构成重复对
+    }
+}
+
+__global__ void extract_repeats(int *input, int input_length, int *output, int output_length) {
+    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < input_length - 1) {
+        if (input[idx] < input[idx + 1]) {
+            int output_idx = input[idx];
+            if (output_idx < output_length) {
+                output[output_idx] = idx; // 将重复对的起始索引写入输出数组
+            }
+        }
+    }
+}
+
 int find_repeats(int* device_input, int length, int* device_output) {
 
     // CS149 TODO:
@@ -245,8 +271,17 @@ int find_repeats(int* device_input, int length, int* device_output) {
     // exclusive_scan function with them. However, your implementation
     // must ensure that the results of find_repeats are correct given
     // the actual array length.
+    int numBlocks = (length + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+    map_repeats<<<numBlocks, THREADS_PER_BLOCK>>>(device_input, device_output, length);
+    cudaDeviceSynchronize();
 
-    return 0; 
+    exclusive_scan(device_output, length, device_output);
+
+    int output_length;
+    cudaMemcpy(&output_length, device_output + length - 1, sizeof(int), cudaMemcpyDeviceToHost);
+    extract_repeats<<<numBlocks, THREADS_PER_BLOCK>>>(device_output, length, device_output, output_length);
+    cudaDeviceSynchronize();
+    return output_length; 
 }
 
 
