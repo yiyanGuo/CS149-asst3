@@ -321,7 +321,7 @@ __global__ void kernelAdvanceSnowflake() {
 // pixel from the circle.  Update of the image is done in this
 // function.  Called by kernelRenderCircles()
 __device__ __inline__ void
-shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
+shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4& existingColor) {
 
     float diffX = p.x - pixelCenter.x;
     float diffY = p.y - pixelCenter.y;
@@ -369,21 +369,17 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
     // BEGIN SHOULD-BE-ATOMIC REGION
     // global memory read
 
-    float4 existingColor = *imagePtr;
-    float4 newColor;
-    newColor.x = alpha * rgb.x + oneMinusAlpha * existingColor.x;
-    newColor.y = alpha * rgb.y + oneMinusAlpha * existingColor.y;
-    newColor.z = alpha * rgb.z + oneMinusAlpha * existingColor.z;
-    newColor.w = alpha + existingColor.w;
+    existingColor.x = alpha * rgb.x + oneMinusAlpha * existingColor.x;
+    existingColor.y = alpha * rgb.y + oneMinusAlpha * existingColor.y;
+    existingColor.z = alpha * rgb.z + oneMinusAlpha * existingColor.z;
+    existingColor.w = alpha + existingColor.w;
 
-    // global memory write
-    *imagePtr = newColor;
 
     // END SHOULD-BE-ATOMIC REGION
 }
 
 
-__device__ __inline__ void shadeTile(int *inBoxIndex, int numCirclesInTile) {
+__device__ __inline__ void shadeTile(int *inBoxIndex, int numCirclesInTile, float4& existingColor) {
     short imageWidth = cuConstRendererParams.imageWidth;
     short imageHeight = cuConstRendererParams.imageHeight;
     float invWidth = 1.f / imageWidth;
@@ -401,9 +397,9 @@ __device__ __inline__ void shadeTile(int *inBoxIndex, int numCirclesInTile) {
         int inBoxIdx = inBoxIndex[i];
         int index3 = 3 * inBoxIdx;
         float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
-        float4 *imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pY * imageWidth + pX)]);
-        shadePixel(inBoxIdx, pixelCenterNorm, p, imgPtr);
+        shadePixel(inBoxIdx, pixelCenterNorm, p, existingColor);
     }
+
 }
 
 __global__ void kernelRenderCircles() {
@@ -421,7 +417,11 @@ __global__ void kernelRenderCircles() {
     int threadPerBlock = blockDim.x * blockDim.y;
     int laneId = tid % 32;
     int warpId = tid / 32;
-    __syncthreads();
+
+    int pX = blockIdx.x * blockDim.x + threadIdx.x;
+    int pY = blockIdx.y * blockDim.y + threadIdx.y;
+    float4 *imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pY * imageWidth + pX)]);
+    float4 existingColor = *imgPtr;
 
 
     float minBoxX = blockDim.x * blockIdx.x * invWidth;
@@ -465,9 +465,11 @@ __global__ void kernelRenderCircles() {
         }
         __syncthreads();
 
-        shadeTile(inBoxIndex, warpStartIndex[7] + warpTotals[7]); // all warps have written their indices to the inBoxIndex array, so the total number of circles in the tile is warpStartIndex[7] + warpTotals[7]
+        shadeTile(inBoxIndex, warpStartIndex[7] + warpTotals[7], existingColor); // all warps have written their indices to the inBoxIndex array, so the total number of circles in the tile is warpStartIndex[7] + warpTotals[7]
         __syncthreads();
     }
+
+    *imgPtr = existingColor;
 }
 ////////////////////////////////////////////////////////////////////////////////////////
 
