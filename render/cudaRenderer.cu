@@ -321,7 +321,7 @@ __global__ void kernelAdvanceSnowflake() {
 // pixel from the circle.  Update of the image is done in this
 // function.  Called by kernelRenderCircles()
 __device__ __inline__ void
-shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr, float *radBuffer) {
+shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4& existingColor, float *radBuffer) {
 
     float diffX = p.x - pixelCenter.x;
     float diffY = p.y - pixelCenter.y;
@@ -369,15 +369,14 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr, floa
     // BEGIN SHOULD-BE-ATOMIC REGION
     // global memory read
 
-    float4 existingColor = *imagePtr;
-    float4 newColor;
-    newColor.x = alpha * rgb.x + oneMinusAlpha * existingColor.x;
-    newColor.y = alpha * rgb.y + oneMinusAlpha * existingColor.y;
-    newColor.z = alpha * rgb.z + oneMinusAlpha * existingColor.z;
-    newColor.w = alpha + existingColor.w;
+    // float4 existingColor = *imagePtr;
+    existingColor.x = alpha * rgb.x + oneMinusAlpha * existingColor.x;
+    existingColor.y = alpha * rgb.y + oneMinusAlpha * existingColor.y;
+    existingColor.z = alpha * rgb.z + oneMinusAlpha * existingColor.z;
+    existingColor.w = alpha + existingColor.w;
 
-    // global memory write
-    *imagePtr = newColor;
+    // // global memory write
+    // *imagePtr = newColor;
 
     // END SHOULD-BE-ATOMIC REGION
 }
@@ -396,13 +395,16 @@ __device__ __inline__ void shadeTile(int *inBoxIndex, float3 *circleBuffer, floa
     }
 
     float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pX) + 0.5f), invHeight * (static_cast<float>(pY) + 0.5f));
-
+    float4 *imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pY * imageWidth + pX)]);
+    float4 existingColor = *imgPtr;
     for(int i = 0; i < numCirclesInTile; i++) {
         int inBoxIdx = inBoxIndex[i];
         float3 p = circleBuffer[inBoxIdx % THREADS_PER_BLOCK]; // circleBuffer is shared memory buffer that contains the circle data for the circles in the tile.  inBoxIndex contains the indices of the circles in the tile, but those indices are with respect to the global list of circles, so we need to mod by THREADS_PER_BLOCK to get the index into the circleBuffer
-        float4 *imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pY * imageWidth + pX)]);
-        shadePixel(inBoxIdx, pixelCenterNorm, p, imgPtr, radBuffer);
+       
+        shadePixel(inBoxIdx, pixelCenterNorm, p, existingColor, radBuffer);
     }
+
+    *imgPtr = existingColor;
 }
 
 __global__ void kernelRenderCircles() {
