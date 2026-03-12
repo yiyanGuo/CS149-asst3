@@ -321,13 +321,13 @@ __global__ void kernelAdvanceSnowflake() {
 // pixel from the circle.  Update of the image is done in this
 // function.  Called by kernelRenderCircles()
 __device__ __inline__ void
-shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
+shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr, float *radBuffer) {
 
     float diffX = p.x - pixelCenter.x;
     float diffY = p.y - pixelCenter.y;
     float pixelDist = diffX * diffX + diffY * diffY;
 
-    float rad = cuConstRendererParams.radius[circleIndex];;
+    float rad = radBuffer[circleIndex % THREADS_PER_BLOCK]; // radius of the circle being shaded.  radBuffer is shared memory buffer that contains the radius data for the circles in the tile.  circleIndex is the index of the circle being shaded with respect to the global list of circles, but we need to mod by THREADS_PER_BLOCK to get the index into the radBuffer
     float maxDist = rad * rad;
 
     // circle does not contribute to the image
@@ -382,55 +382,8 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
     // END SHOULD-BE-ATOMIC REGION
 }
 
-// kernelRenderCircles -- (CUDA device code)
-//
-// Each thread renders a circle.  Since there is no protection to
-// ensure order of update or mutual exclusion on the output image, the
-// resulting image will be incorrect.
-// __global__ void kernelRenderCircles() {
 
-//     int index = blockIdx.x * blockDim.x + threadIdx.x;
-
-//     if (index >= cuConstRendererParams.numCircles)
-//         return;
-
-//     int index3 = 3 * index;
-
-//     // read position and radius
-//     float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
-//     float  rad = cuConstRendererParams.radius[index];
-
-//     // compute the bounding box of the circle. The bound is in integer
-//     // screen coordinates, so it's clamped to the edges of the screen.
-//     short imageWidth = cuConstRendererParams.imageWidth;
-//     short imageHeight = cuConstRendererParams.imageHeight;
-//     short minX = static_cast<short>(imageWidth * (p.x - rad));
-//     short maxX = static_cast<short>(imageWidth * (p.x + rad)) + 1;
-//     short minY = static_cast<short>(imageHeight * (p.y - rad));
-//     short maxY = static_cast<short>(imageHeight * (p.y + rad)) + 1;
-
-//     // a bunch of clamps.  Is there a CUDA built-in for this?
-//     short screenMinX = (minX > 0) ? ((minX < imageWidth) ? minX : imageWidth) : 0;
-//     short screenMaxX = (maxX > 0) ? ((maxX < imageWidth) ? maxX : imageWidth) : 0;
-//     short screenMinY = (minY > 0) ? ((minY < imageHeight) ? minY : imageHeight) : 0;
-//     short screenMaxY = (maxY > 0) ? ((maxY < imageHeight) ? maxY : imageHeight) : 0;
-
-//     float invWidth = 1.f / imageWidth;
-//     float invHeight = 1.f / imageHeight;
-
-//     // for all pixels in the bonding box
-//     for (int pixelY=screenMinY; pixelY<screenMaxY; pixelY++) {
-//         float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + screenMinX)]);
-//         for (int pixelX=screenMinX; pixelX<screenMaxX; pixelX++) {
-//             float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
-//                                                  invHeight * (static_cast<float>(pixelY) + 0.5f));
-//             shadePixel(index, pixelCenterNorm, p, imgPtr);
-//             imgPtr++;
-//         }
-//     }
-// }
-
-__device__ __inline__ void shadeTile(int *inBoxIndex, int numCirclesInTile) {
+__device__ __inline__ void shadeTile(int *inBoxIndex, float3 *circleBuffer, float *radBuffer, int numCirclesInTile) {
     short imageWidth = cuConstRendererParams.imageWidth;
     short imageHeight = cuConstRendererParams.imageHeight;
     float invWidth = 1.f / imageWidth;
@@ -446,10 +399,9 @@ __device__ __inline__ void shadeTile(int *inBoxIndex, int numCirclesInTile) {
 
     for(int i = 0; i < numCirclesInTile; i++) {
         int inBoxIdx = inBoxIndex[i];
-        int index3 = 3 * inBoxIdx;
-        float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
+        float3 p = circleBuffer[inBoxIdx % THREADS_PER_BLOCK]; // circleBuffer is shared memory buffer that contains the circle data for the circles in the tile.  inBoxIndex contains the indices of the circles in the tile, but those indices are with respect to the global list of circles, so we need to mod by THREADS_PER_BLOCK to get the index into the circleBuffer
         float4 *imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pY * imageWidth + pX)]);
-        shadePixel(inBoxIdx, pixelCenterNorm, p, imgPtr);
+        shadePixel(inBoxIdx, pixelCenterNorm, p, imgPtr, radBuffer);
     }
 }
 
@@ -460,6 +412,8 @@ __global__ void kernelRenderCircles() {
     float invWidth = 1.f / imageWidth;
     float invHeight = 1.f / imageHeight; 
     // tiling
+    __shared__ float3 circleBuffer[THREADS_PER_BLOCK];
+    __shared__ float radBuffer[THREADS_PER_BLOCK];
     __shared__ int inBoxIndex[THREADS_PER_BLOCK]; // each iteration processes CIRCLES_PER_ITER circles, but we need some extra space to store the indices of the circles that are in the tile
     __shared__ int warpTotals[8]; // assume at most 256 threads per block, so at most 8 warps
     __shared__ int warpStartIndex[8]; // prefix sum of warpTotals to determine where each warp should write in the inBoxIndex array
@@ -480,12 +434,14 @@ __global__ void kernelRenderCircles() {
     for(int iter = 0; iter < numIters; iter++) {
         int i = iter * threadPerBlock + tid;
         bool valid = i < cuConstRendererParams.numCircles;
+        // move circle data to buffer
+        circleBuffer[tid] = valid ? *(float3*)(&cuConstRendererParams.position[3*i]) : make_float3(0.f, 0.f, 0.f);
+        radBuffer[tid] = valid ? cuConstRendererParams.radius[i] : 0.f;
 
         bool isInBox = false;
         if(valid) {
-            int index3 = 3 * i;
-            float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
-            float rad = cuConstRendererParams.radius[i];
+            float3 p = circleBuffer[tid];
+            float rad = radBuffer[tid];
             isInBox = circleInBoxConservative(p.x, p.y, rad, minBoxX, maxBoxX, maxBoxY, minBoxY);
         }
 
@@ -512,7 +468,7 @@ __global__ void kernelRenderCircles() {
         }
         __syncthreads();
 
-        shadeTile(inBoxIndex, warpStartIndex[7] + warpTotals[7]); // all warps have written their indices to the inBoxIndex array, so the total number of circles in the tile is warpStartIndex[7] + warpTotals[7]
+        shadeTile(inBoxIndex, circleBuffer, radBuffer, warpStartIndex[7] + warpTotals[7]); // all warps have written their indices to the inBoxIndex array, so the total number of circles in the tile is warpStartIndex[7] + warpTotals[7]
         __syncthreads();
     }
 }
