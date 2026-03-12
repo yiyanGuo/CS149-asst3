@@ -14,6 +14,8 @@
 #include "sceneLoader.h"
 #include "util.h"
 
+#define THREADS_PER_BLOCK 256
+#define CIRCLES_PER_ITER 1024
 ////////////////////////////////////////////////////////////////////////////////////////
 // Putting all the cuda kernels here
 ///////////////////////////////////////////////////////////////////////////////////////
@@ -55,6 +57,7 @@ __constant__ float  cuConstColorRamp[COLOR_MAP_SIZE][3];
 // file simpler and to seperate code that should not be modified
 #include "noiseCuda.cu_inl"
 #include "lookupColor.cu_inl"
+#include "circleBoxTest.cu_inl"
 
 
 // kernelClearImageSnowflake -- (CUDA device code)
@@ -427,29 +430,90 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
 //     }
 // }
 
-__global__ void kernelRenderCircles() {
-    // int threadX = threadIdx.x + blockIdx.x * blockDim.x;
-    // int threadY = threadIdx.y + blockIdx.y * blockDim.y;
-    
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-
+__device__ __inline__ void shadeTile(int *inBoxIndex, int numCirclesInTile) {
     short imageWidth = cuConstRendererParams.imageWidth;
     short imageHeight = cuConstRendererParams.imageHeight;
-
-    int pX = tid % imageWidth;
-    int pY = tid / imageWidth;
-
     float invWidth = 1.f / imageWidth;
     float invHeight = 1.f / imageHeight;
 
-    float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pX) + 0.5f),
-                                     invHeight * (static_cast<float>(pY) + 0.5f));
+    int pX = blockIdx.x * blockDim.x + threadIdx.x;
+    int pY = blockIdx.y * blockDim.y + threadIdx.y;
+    if (pX >= imageWidth || pY >= imageHeight) {
+        return;
+    }
 
-    for(int i = 0; i < cuConstRendererParams.numCircles; i++) {
-        int index3 = 3 * i;
+    float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pX) + 0.5f), invHeight * (static_cast<float>(pY) + 0.5f));
+
+    for(int i = 0; i < numCirclesInTile; i++) {
+        int inBoxIdx = inBoxIndex[i];
+        int index3 = 3 * inBoxIdx;
         float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
         float4 *imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pY * imageWidth + pX)]);
-        shadePixel(i, pixelCenterNorm, p, imgPtr);
+        shadePixel(inBoxIdx, pixelCenterNorm, p, imgPtr);
+    }
+}
+
+__global__ void kernelRenderCircles() {
+
+    short imageWidth = cuConstRendererParams.imageWidth;
+    short imageHeight = cuConstRendererParams.imageHeight;
+    float invWidth = 1.f / imageWidth;
+    float invHeight = 1.f / imageHeight; 
+    // tiling
+    __shared__ int inBoxIndex[THREADS_PER_BLOCK]; // each iteration processes CIRCLES_PER_ITER circles, but we need some extra space to store the indices of the circles that are in the tile
+    __shared__ int warpTotals[8]; // assume at most 256 threads per block, so at most 8 warps
+    __shared__ int warpStartIndex[8]; // prefix sum of warpTotals to determine where each warp should write in the inBoxIndex array
+
+    int tid = blockDim.x * threadIdx.y + threadIdx.x;
+    int threadPerBlock = blockDim.x * blockDim.y;
+    int laneId = tid % 32;
+    int warpId = tid / 32;
+    __syncthreads();
+
+
+    float minBoxX = blockDim.x * blockIdx.x * invWidth;
+    float maxBoxX = min(minBoxX + blockDim.x * invWidth, 1.f);
+    float minBoxY = blockDim.y * blockIdx.y * invHeight;
+    float maxBoxY = min(minBoxY + blockDim.y * invHeight, 1.f);
+
+    int numIters = (cuConstRendererParams.numCircles + threadPerBlock - 1) / threadPerBlock;
+    for(int iter = 0; iter < numIters; iter++) {
+        int i = iter * threadPerBlock + tid;
+        bool valid = i < cuConstRendererParams.numCircles;
+
+        bool isInBox = false;
+        if(valid) {
+            int index3 = 3 * i;
+            float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
+            float rad = cuConstRendererParams.radius[i];
+            isInBox = circleInBoxConservative(p.x, p.y, rad, minBoxX, maxBoxX, maxBoxY, minBoxY);
+        }
+
+        unsigned int mask = __ballot_sync(0xffffffff, isInBox);
+        unsigned int lowerThreadMask = (1u << laneId) - 1;
+        int warpOffset = __popc(mask & lowerThreadMask);
+
+        if(laneId == 0) {
+            warpTotals[warpId] = __popc(mask);
+        }
+        __syncthreads();
+
+        if(tid == 0) {
+            int sum = 0;
+            for(int j = 0; j < 8; j++) {
+                warpStartIndex[j] = sum;
+                sum += warpTotals[j];
+            }
+        }
+        __syncthreads();
+
+        if(isInBox) {
+            inBoxIndex[warpStartIndex[warpId] + warpOffset] = i;
+        }
+        __syncthreads();
+
+        shadeTile(inBoxIndex, warpStartIndex[7] + warpTotals[7]); // all warps have written their indices to the inBoxIndex array, so the total number of circles in the tile is warpStartIndex[7] + warpTotals[7]
+        __syncthreads();
     }
 }
 ////////////////////////////////////////////////////////////////////////////////////////
@@ -662,8 +726,9 @@ void
 CudaRenderer::render() {
 
     // 256 threads per block is a healthy number
-    dim3 blockDim(256, 1);
-    dim3 gridDim((this->image->height * this->image->width + blockDim.x - 1) / blockDim.x);
+    dim3 blockDim(16, 16);
+    dim3 gridDim((image->width + blockDim.x - 1) / blockDim.x,
+                 (image->height + blockDim.y - 1) / blockDim.y);
 
     kernelRenderCircles<<<gridDim, blockDim>>>();
     cudaDeviceSynchronize();
